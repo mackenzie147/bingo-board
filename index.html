@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>2025 Bingo Board</title>
+    <title>Bingo Board</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -21,7 +22,11 @@
         .bingo-item {
             aspect-ratio: 1 / 1;
             transition: all 0.2s ease-in-out;
-            cursor: pointer;
+            cursor: grab;
+            position: relative;
+        }
+        .bingo-item:active {
+             cursor: grabbing;
         }
         .bingo-item.status-inprogress {
             background-color: #FEF9C3; /* yellow-100 */
@@ -41,6 +46,32 @@
             outline: none;
             box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
             border-radius: 4px;
+            cursor: text;
+        }
+        .delete-btn {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            background-color: white;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid #e5e7eb;
+            cursor: pointer;
+            opacity: 0;
+            transform: scale(0.8);
+            transition: all 0.2s ease;
+        }
+        .bingo-item:hover .delete-btn {
+            opacity: 1;
+            transform: scale(1);
+        }
+        .sortable-ghost {
+            opacity: 0.4;
+            background: #c8ebfb;
         }
     </style>
 </head>
@@ -48,8 +79,11 @@
 
     <div id="app" class="container mx-auto p-4 md:p-8 max-w-4xl">
         <header class="text-center mb-8">
-            <h1 class="text-4xl md:text-5xl font-bold text-gray-900">2025 Bingo Board</h1>
-            <p id="subheading" class="text-gray-500 mt-2">Add your goals and track your progress!</p>
+            <div class="flex items-center justify-center gap-2">
+                <h1 class="text-4xl md:text-5xl font-bold text-gray-900">Bingo Board</h1>
+                 <input type="number" id="year-selector" value="2025" class="w-24 p-1 text-4xl md:text-5xl font-bold bg-transparent text-center focus:outline-none focus:ring-2 focus:ring-blue-500 rounded-lg">
+            </div>
+            <p id="subheading" class="text-gray-500 mt-2">Drag to reorder, double-click to edit, click to update status.</p>
         </header>
 
         <div id="auth-loading" class="text-center py-10">
@@ -81,18 +115,8 @@
         // Firebase Imports
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-        import { getFirestore, collection, doc, onSnapshot, addDoc, updateDoc, deleteDoc, serverTimestamp, query } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { getFirestore, collection, doc, onSnapshot, addDoc, updateDoc, deleteDoc, serverTimestamp, query, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-        // -----------------------------------------------------------------------------
-        // IMPORTANT:
-        // You are seeing this because you ran into a common configuration issue!
-        // The application, when running on your local computer or on a fresh deployment,
-        // doesn't know where to save your data online. To fix this, we need to connect
-        // it to a free "backend" service from Google called Firebase. It's
-        // a one-time setup that will give you a special key to paste into the file.
-        // -----------------------------------------------------------------------------
-        // PASTE YOUR FIREBASE CONFIGURATION HERE
-        // -----------------------------------------------------------------------------
         const firebaseConfig = {
           apiKey: "AIzaSyB8q-jT15zfaiiqHDyeoZl_Ccz5tQMTzk4",
           authDomain: "bingo-project-e9e10.firebaseapp.com",
@@ -102,12 +126,10 @@
           appId: "1:995103961297:web:e5f07ed199e02bc4ee95f0",
           measurementId: "G-KL097JXKRC"
         };
-        // -----------------------------------------------------------------------------
-        // END OF FIREBASE CONFIGURATION
-        // -----------------------------------------------------------------------------
 
         // -- App State --
         let db, auth, userId, itemsUnsubscribe;
+        let currentYear = 2025;
         const items = new Map();
 
         // -- DOM Elements --
@@ -117,6 +139,7 @@
         const newItemInput = document.getElementById('new-item-input');
         const addItemBtn = document.getElementById('add-item-btn');
         const bingoGrid = document.getElementById('bingo-grid');
+        const yearSelector = document.getElementById('year-selector');
 
         // -- Firebase Initialization --
         function initializeFirebase() {
@@ -133,13 +156,14 @@
                 showAuthError();
             }
         }
-
+        
         function handleAuthentication() {
             onAuthStateChanged(auth, user => {
                 if (user) {
                     userId = user.uid;
                     authLoadingEl.classList.add('hidden');
                     appContentEl.classList.remove('hidden');
+                    initializeSortable();
                     listenForItems();
                 } else {
                     signInAnonymously(auth).catch(error => {
@@ -157,31 +181,45 @@
 
         // -- Firestore Functions --
         function listenForItems() {
-            if (itemsUnsubscribe) itemsUnsubscribe(); // Unsubscribe from previous listener
+            if (itemsUnsubscribe) itemsUnsubscribe();
             
-            const itemsRef = collection(db, 'bingoBoards', '2025', 'items');
+            items.clear();
+            bingoGrid.innerHTML = '';
+            
+            const itemsRef = collection(db, 'bingoBoards', String(currentYear), 'items');
             const q = query(itemsRef);
 
             itemsUnsubscribe = onSnapshot(q, (snapshot) => {
+                let shouldRenderAll = false;
                 snapshot.docChanges().forEach((change) => {
                     const docData = change.doc.data();
                     const docId = change.doc.id;
 
                     if (change.type === "added") {
                         items.set(docId, { id: docId, ...docData });
-                        renderNewItem(docId, docData);
+                        shouldRenderAll = true; 
                     }
                     if (change.type === "modified") {
+                        const oldData = items.get(docId);
                         items.set(docId, { id: docId, ...docData });
-                        updateItemInDOM(docId, docData);
+                        if(oldData && oldData.order !== docData.order) {
+                            shouldRenderAll = true; // Re-render if order changes
+                        } else {
+                            updateItemInDOM(docId, docData);
+                        }
                     }
                     if (change.type === "removed") {
                         items.delete(docId);
                         removeItemFromDOM(docId);
                     }
                 });
+                
+                if (shouldRenderAll) {
+                    renderAllItems();
+                }
+
             }, (error) => {
-                console.error("Error listening to items:", error);
+                console.error(`Error listening to items for year ${currentYear}:`, error);
             });
         }
         
@@ -190,10 +228,11 @@
             if (text === '') return;
             
             try {
-                const itemsRef = collection(db, 'bingoBoards', '2025', 'items');
+                const itemsRef = collection(db, 'bingoBoards', String(currentYear), 'items');
                 await addDoc(itemsRef, {
                     text: text,
-                    status: 'normal', // normal, inprogress, completed
+                    status: 'normal',
+                    order: items.size, // Set order to the current number of items
                     createdAt: serverTimestamp()
                 });
                 newItemInput.value = '';
@@ -204,7 +243,7 @@
 
         async function updateItem(id, data) {
             try {
-                const itemRef = doc(db, 'bingoBoards', '2025', 'items', id);
+                const itemRef = doc(db, 'bingoBoards', String(currentYear), 'items', id);
                 await updateDoc(itemRef, data);
             } catch (error) {
                 console.error("Error updating item:", error);
@@ -213,59 +252,117 @@
         
         async function deleteItem(id) {
              try {
-                const itemRef = doc(db, 'bingoBoards', '2025', 'items', id);
+                const itemRef = doc(db, 'bingoBoards', String(currentYear), 'items', id);
                 await deleteDoc(itemRef);
             } catch (error) {
                 console.error("Error deleting item:", error);
             }
         }
 
+        async function updateItemsOrder() {
+            const batch = writeBatch(db);
+            const itemElements = Array.from(bingoGrid.children);
+            
+            itemElements.forEach((el, index) => {
+                const id = el.dataset.id;
+                if (id) {
+                    const itemRef = doc(db, 'bingoBoards', String(currentYear), 'items', id);
+                    batch.update(itemRef, { order: index });
+                }
+            });
 
-        // -- DOM Manipulation --
-        function renderNewItem(id, data) {
+            try {
+                await batch.commit();
+            } catch (error) {
+                console.error("Error updating order:", error);
+            }
+        }
+
+        // -- DOM Manipulation & Rendering --
+        function renderAllItems() {
+            bingoGrid.innerHTML = ''; // Clear the grid
+            const sortedItems = Array.from(items.values()).sort((a, b) => (a.order || 0) - (b.order || 0));
+            sortedItems.forEach(item => {
+                const itemEl = createItemElement(item.id, item);
+                bingoGrid.appendChild(itemEl);
+            });
+        }
+
+        function createItemElement(id, data) {
             const itemEl = document.createElement('div');
             itemEl.id = `item-${id}`;
+            itemEl.dataset.id = id;
             itemEl.className = 'bingo-item flex items-center justify-center p-3 border-2 border-gray-300 bg-white rounded-lg shadow-sm text-center';
             
             const textEl = document.createElement('p');
             textEl.className = 'item-text text-sm font-medium';
             textEl.textContent = data.text;
             
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'delete-btn';
+            deleteBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-x-lg text-gray-500 hover:text-red-500" viewBox="0 0 16 16"><path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8z"/></svg>`;
+            deleteBtn.onclick = (e) => {
+                e.stopPropagation(); // Prevent status change click
+                if (confirm('Are you sure you want to delete this item?')) {
+                    deleteItem(id);
+                }
+            };
+
             itemEl.appendChild(textEl);
-            bingoGrid.appendChild(itemEl);
-            
-            updateItemInDOM(id, data);
+            itemEl.appendChild(deleteBtn);
+
+            updateItemStyles(itemEl, data);
+            return itemEl;
         }
         
         function updateItemInDOM(id, data) {
             const itemEl = document.getElementById(`item-${id}`);
             if (!itemEl) return;
             
-            itemEl.className = 'bingo-item flex items-center justify-center p-3 border-2 border-gray-300 bg-white rounded-lg shadow-sm text-center'; // Reset classes
-            if (data.status === 'inprogress') {
-                itemEl.classList.add('status-inprogress');
-            } else if (data.status === 'completed') {
-                itemEl.classList.add('status-completed');
-            }
+            updateItemStyles(itemEl, data);
             
             const textEl = itemEl.querySelector('.item-text');
             if (textEl && textEl.textContent !== data.text) {
                  textEl.textContent = data.text;
             }
         }
+
+        function updateItemStyles(element, data) {
+            element.className = 'bingo-item flex items-center justify-center p-3 border-2 border-gray-300 bg-white rounded-lg shadow-sm text-center'; // Reset classes
+            if (data.status === 'inprogress') {
+                element.classList.add('status-inprogress');
+            } else if (data.status === 'completed') {
+                element.classList.add('status-completed');
+            }
+        }
         
         function removeItemFromDOM(id) {
             const itemEl = document.getElementById(`item-${id}`);
-            if (itemEl) {
-                itemEl.remove();
-            }
+            if (itemEl) itemEl.remove();
+        }
+
+        // -- Drag and Drop --
+        function initializeSortable() {
+            new Sortable(bingoGrid, {
+                animation: 150,
+                ghostClass: 'sortable-ghost',
+                onEnd: () => {
+                    updateItemsOrder();
+                }
+            });
         }
         
         // -- Event Listeners --
         addItemBtn.addEventListener('click', addNewItem);
         newItemInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                addNewItem();
+            if (e.key === 'Enter') addNewItem();
+        });
+
+        yearSelector.addEventListener('change', () => {
+            const year = parseInt(yearSelector.value);
+            if (!isNaN(year) && year > 1900 && year < 3000 && year !== currentYear) {
+                currentYear = year;
+                listenForItems();
             }
         });
 
@@ -273,10 +370,10 @@
             const itemEl = e.target.closest('.bingo-item');
             if (!itemEl) return;
 
-            // Prevent status change if text is being edited
-            if (itemEl.querySelector('.item-text[contenteditable="true"]')) return;
+            // Prevent clicks on the delete button or editable text from triggering status change
+            if (e.target.closest('.delete-btn') || itemEl.querySelector('.item-text[contenteditable="true"]')) return;
 
-            const id = itemEl.id.replace('item-', '');
+            const id = itemEl.dataset.id;
             const currentItem = items.get(id);
             if (!currentItem) return;
             
@@ -293,12 +390,11 @@
             if (!textEl) return;
             
             const itemEl = textEl.closest('.bingo-item');
-            const id = itemEl.id.replace('item-', '');
+            const id = itemEl.dataset.id;
             
             textEl.setAttribute('contenteditable', 'true');
             textEl.focus();
             
-            // Select all text
             const selection = window.getSelection();
             const range = document.createRange();
             range.selectNodeContents(textEl);
